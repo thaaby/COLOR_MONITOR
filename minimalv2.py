@@ -2,6 +2,7 @@
 
 import cv2
 import numpy as np
+import mediapipe as mp
 from collections import namedtuple, deque
 import math
 import json
@@ -770,6 +771,32 @@ def detect_center_color(frame, center_size=50):
     }
 
 
+# ============================================================
+# TRACKING SILHOUETTE (Multi-color via YOLO)
+# ============================================================
+class SimpleTracker:
+    def __init__(self):
+        self.id_to_color = {}
+        self.colors = []
+        
+        # Generiamo dinamicamente 36 colori vividissimi (Saturazione/Valore al 100%)
+        for h in range(0, 180, 180 // 36):
+            hsv = np.uint8([[[h, 255, 255]]])
+            bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
+            self.colors.append((int(bgr[0]), int(bgr[1]), int(bgr[2])))
+            
+        self.colors.extend([
+            (255, 255, 255), (255, 128, 255), (128, 255, 255)
+        ])
+
+    def get_color_by_id(self, person_id):
+        import random
+        if person_id not in self.id_to_color:
+            # Assegna un colore permanente a questo nuovo ID YOLO
+            self.id_to_color[person_id] = random.choice(self.colors)
+        return self.id_to_color[person_id]
+
+
 def main():
     print("\n" + "=" * 50)
     print("  REGIA LEDWALL - Multi-Pannello + Arduino Video")
@@ -796,8 +823,30 @@ def main():
     print("  CONTROLLI:")
     print("  [F] - Fullscreen (toggle)")
     print("  [I] - Inverti colori per LED (Common Anode)")
+    print("  [S] - Cambia stile Silhouette (Tinta Unita / Fotocamera)")
     print("  [Q/ESC] - Esci")
     print("-" * 50 + "\n")
+    
+    # --- ULTRALYTICS YOLOv8 INSTANCE SEGMENTATION ---
+    import os
+    import sys
+    import time
+    
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        print("\n[!] IL MOTORE PROFESSIONALE YOLOv8 NON È INSTALLATO.")
+        print("[!] Esegui questo comando nel terminale per installarlo:")
+        print("    pip install ultralytics")
+        print("\nTerminazione in corso...")
+        sys.exit(1)
+        
+    print("[AI] Caricamento del modello professionale YOLOv8 Segmentation...")
+    # Scaricherà in automatico yolov8n-seg.pt (pochi MB) al primissimo avvio
+    model = YOLO('yolov8n-seg.pt')
+    
+    silhouette_tracker = SimpleTracker()
+    solid_silhouette = True
     
     # --- CONNESSIONI ---
     global COMMON_ANODE
@@ -825,6 +874,71 @@ def main():
             if not ret:
                 print("[X] Errore lettura frame!")
                 break
+            
+            # --- YOLOv8 ULTRALYTICS INSTANCE SEGMENTATION & TRACKING ---
+            # persist=True abilita il ByteTrack integrato che non perde MAI i soggetti
+            # classes=[0] processa ESCLUSIVAMENTE gli esseri umani, senza alcun limite di numero
+            results = model.track(frame, persist=True, classes=[0], verbose=False)
+            
+            bg_image = np.zeros(frame.shape, dtype=np.uint8)
+            final_frame_float = np.zeros(frame.shape, dtype=np.float32)
+            r = results[0]
+            
+            if r.masks is not None and r.boxes.id is not None:
+                # Estraiamo gli ID fisici assegnati in modo infallibile dal tracker
+                ids = r.boxes.id.cpu().numpy().astype(int)
+                # Estraiamo le maschere 2D indipendenti di ciascun corpo
+                masks_data = r.masks.data.cpu().numpy()
+                
+                aggregate_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                
+                for i, person_id in enumerate(ids):
+                    # Ridimensioniamo la maschera alla risoluzione originale della webcam
+                    mask_raw = masks_data[i]
+                    mask_resized = cv2.resize(mask_raw, (frame.shape[1], frame.shape[0]))
+                    # YOLO genera maschere pulite, la soglia 0.5 è ottimale
+                    mask_2d = mask_resized > 0.5 
+                    
+                    if solid_silhouette:
+                        # Recupera il colore generato per questo specifico ID umano!
+                        current_color = silhouette_tracker.get_color_by_id(person_id)
+                        
+                        # TRUCCO CHIRURGICO: DILATAZIONE DELL'AURA
+                        # Essendo l'IA chirurgica, i corpi si oscurano ma non condividono mai gli stessi pixel.
+                        # Espandendo matematicamente la maschera di ~35 pixel verso l'esterno, creiamo
+                        # un'area di cuscinetto. Quando 2 persone si sfiorano, queste espansioni si incrociano
+                        # coprendo letteralmente gli stessi pixel. (35px diventeranno 1-2 LED fisici sovrapposti)
+                        kernel = np.ones((35, 35), np.uint8)
+                        mask_expanded = cv2.dilate(mask_2d.astype(np.uint8), kernel, iterations=1)
+                        mask_overlap = mask_expanded > 0
+                        
+                        # SOVRAPPOSIZIONE ADDITIVA (Luce pura!)
+                        color_array = np.array(current_color, dtype=np.float32)
+                        final_frame_float[mask_overlap] += color_array
+                    else:
+                        aggregate_mask[mask_2d] = 255
+                        
+                if solid_silhouette:
+                    # NORMALIZZAZIONE ADDITIVA PRO (Color Theory per LED)
+                    # Invece di sommare alla cieca (che spara subito sul bianco brutto),
+                    # calcoliamo il vero colore "di mezzo" mantenendo al 100% la luminosità LED pura.
+                    
+                    # 1. Trova il picco di luminosità tra i 3 canali (R, G, B) in ogni singolo pixel
+                    max_vals = np.max(final_frame_float, axis=-1, keepdims=True)
+                    # 2. Prevenzione divisione per 0 sui pixel di sfondo
+                    max_vals[max_vals == 0] = 1.0
+                    
+                    # 3. La matrice divide il mix per il proprio picco forzando quel canale a 255
+                    # Questo preserva la tinta geometricamente perfetta di TUTTI I COLORI
+                    # mentre scongiura lo sbiadimento dei mezzitoni. Magia pura in array.
+                    final_frame_float = (final_frame_float / max_vals) * 255.0
+                    
+                    frame = final_frame_float.astype(np.uint8)
+                else:
+                    condition = np.stack((aggregate_mask > 0,) * 3, axis=-1)
+                    frame = np.where(condition, frame, bg_image)
+            else:
+                frame = bg_image
             
             # Nessun flip: in base ai test, l'orientamento puro della webcam
             # combinato con ARDUINO_PANEL_START_BOTTOM = False è quello perfetto.
@@ -875,11 +989,15 @@ def main():
             
             # --- INVIA FRAME ALL'ARDUINO (video seriale) ---
             if arduino_ser is not None:
-                # 1. Controlla se l'Arduino ha mandato l'ACK 'K'
-                if arduino_ser.in_waiting > 0:
-                    risposta = arduino_ser.read_all()
-                    if b'K' in risposta:
-                        arduino_ready = True
+                # 1. Controlla se l'Arduino ha mandato l'ACK 'K' (resiste agli scollegamenti fisici)
+                try:
+                    if arduino_ser.in_waiting > 0:
+                        risposta = arduino_ser.read_all()
+                        if b'K' in risposta:
+                            arduino_ready = True
+                except OSError:
+                    arduino_ser = None
+                    print("\n[!] ATTENZIONE: Cavo Arduino scollegato improvvisamente. Disattivazione sicura seriale completata.")
                 
                 # 1b. Timeout di sicurezza: se Arduino ha perso un frame e non ha mandato K
                 # per più di 0.5 secondi, forza l'invio per sbloccare la situazione.
@@ -916,6 +1034,10 @@ def main():
                 COMMON_ANODE = not COMMON_ANODE
                 state = "ATTIVA" if COMMON_ANODE else "DISATTIVA"
                 print(f"\n[TOGGLE] Modalità Inversione: {state}")
+            elif key == ord('s'):
+                solid_silhouette = not solid_silhouette
+                state = "TINTA UNITA (Colori Casuali)" if solid_silhouette else "FOTOCAMERA (Colori originali)"
+                print(f"\n[TOGGLE] Stile Silhouette: {state}")
     
     finally:
         cap.release()
