@@ -214,7 +214,7 @@ COLOR_DATABASE = [
 # CONFIGURAZIONE MAXISCHERMO ESP (MULTI-PANNELLO UDP)
 # ============================================================
 # IP dei 3 ESP (da sinistra a destra)
-ESP_IPS = ["192.168.1.51", "192.168.1.52", "192.168.1.60"]
+ESP_IPS = ["192.168.1.61", "192.168.1.62", "192.168.1.63", "192.168.1.64", "192.168.1.65",  "192.168.1.68"]
 ESP_PORT = 4210
 
 # Dimensioni di ogni singolo pannello LED ESP
@@ -222,26 +222,26 @@ PANEL_WIDTH = 15
 PANEL_HEIGHT = 44
 TOTAL_WIDTH = PANEL_WIDTH * len(ESP_IPS)  # Larghezza totale del ledwall
 
+# Orientamento e serpentina ESP
+ESP_SERPENTINE_HORIZONTAL = True
+ESP_START_BOTTOM = False  # False = in alto a sx. True = in basso a sx.
+
 # ============================================================
 # CONFIGURAZIONE ARDUINO VIDEO (SERIALE)
 # ============================================================
 ARDUINO_ENABLED = True            # Abilita streaming video via seriale
 ARDUINO_PORT = "auto"             # Porta seriale ('auto' per rilevamento automatico)
 ARDUINO_BAUD = 500000             # Deve corrispondere al baud rate dello sketch
-ARDUINO_ROWS = 32                 # 4 pannelli impilati × 8 righe ciascuno
-ARDUINO_COLS = 32                 # Larghezza di un pannello
+ARDUINO_ROWS = 32                 # Altezza totale
+ARDUINO_COLS = 56                 # Larghezza totale (7 pannelli da 8 = 56)
 # Configurazione Orientamento Pannelli Arduino
-ARDUINO_PANEL_W = 8               # Larghezza di un singolo pannello fisico
-ARDUINO_PANEL_H = 32              # Altezza di un singolo pannello fisico
-ARDUINO_PANELS_COUNT = 4          # Quanti pannelli ci sono
+ARDUINO_PANEL_W = 8               # Larghezza del singolo pannello fisico
+ARDUINO_PANEL_H = 32              # Altezza del singolo pannello fisico
+ARDUINO_PANELS_COUNT = 7          # 7 pannelli 8x32 = 56x32
 
-# Configurazione cablaggio ricavata dalla foto del retro:
-# Pannello 0 (destra): entra da sotto, esce da sopra
-# Pannello 1 (centro-dx): entra da sopra, esce da sotto
-# Pannello 2 (centro-sx): entra da sotto, esce da sopra
-# L'utente ha confermato che l'ordine fisico va invertito
-ARDUINO_PANEL_ORDER = [0, 1, 2, 3]  # Era [3, 2, 1, 0]
-ARDUINO_PANEL_START_BOTTOM = [False, False, False, False] # Il P2 e P4 (indici 1 e 3) rovesciati su richiesta, ora tutto parte da sopra per non vederla sottosopra
+# Configurazione del cablaggio (0 = estrema destra, 6 = estrema sinistra):
+ARDUINO_PANEL_ORDER = [6, 5, 4, 3, 2, 1, 0]
+ARDUINO_PANEL_START_BOTTOM = [False, False, False, False, False, False, False]
 ARDUINO_SERPENTINE_X = True         # Zigzag orizzontale dentro il pannello
 
 GAMMA = 2.5           
@@ -311,14 +311,11 @@ def create_arduino_serial():
 
 
 def map_frame_to_leds(frame_rgb):
-    """Mappa l'immagine 32x32 quadrata nell'ordine fisico dei 4 pannelli LED.
-    
-    In base al cablaggio (foto dal retro): i pannelli formano un serpente gigante.
-    P0 (destra) va dal basso verso l'alto.
-    P1 (centro-dx) va dall'alto verso il basso.
-    P2 (centro-sx) va dal basso verso l'alto.
-    P3 (sinistra) va dall'alto verso il basso.
-    All'interno di ogni riga da 8 led, il segnale sfolla a zigzag.
+    """Mappa l'immagine 56x32 nell'ordine fisico dei 7 pannelli LED (8x32 ciascuno).
+
+    7 pannelli da 8x32 collegati in serie = 56x32 totali.
+    ARDUINO_PANEL_ORDER definisce quale posizione X occupa ogni pannello fisico.
+    All'interno di ogni pannello, il segnale è a zigzag orizzontale (serpentina).
     """
     out_buffer = bytearray(ARDUINO_COLS * ARDUINO_ROWS * 3)
     idx = 0
@@ -377,14 +374,15 @@ def send_arduino_frame(ser, frame, use_gamma=True):
     """Invia un frame webcam all'Arduino come pixel RGB grezzi.
     
     1. Ridimensiona il frame a ARDUINO_COLS × ARDUINO_ROWS
-    2. Converte BGR → RGB
+    2. Converte BGR -> RGB
     3. Applica gamma (opzionale)
     4. Rimappa serpentina
-    5. Invia: byte 'V' + 3072 byte RGB
+    5. Invia: byte MAGIC HEADER (0xFF 0x4C 0x45) + 3072 byte RGB
     """
     # Ridimensiona alla risoluzione della matrice LED
     small = cv2.resize(frame, (ARDUINO_COLS, ARDUINO_ROWS), interpolation=cv2.INTER_AREA)
     rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    rgb = cv2.flip(rgb, 0)  # Corregge orientamento verticale (pannelli montati a testa in giù)
     
     # Correggi gamma
     if use_gamma:
@@ -397,8 +395,8 @@ def send_arduino_frame(ser, frame, use_gamma=True):
     # Applica mappatura fisica complessa
     rgb_bytes = map_frame_to_leds(rgb)
     
-    # Invia: header 'V' + dati RGB mappati
-    ser.write(b'V' + rgb_bytes)
+    # Invia: header MAGIC_HEADER + dati RGB mappati
+    ser.write(b'\xFF\x4C\x45' + rgb_bytes)
 
 
 def niente(x):
@@ -874,6 +872,9 @@ def main():
             if not ret:
                 print("[X] Errore lettura frame!")
                 break
+                
+            # Specchia orizzontalmente la webcam come richiesto
+            frame = cv2.flip(frame, 1)
             
             # --- YOLOv8 ULTRALYTICS INSTANCE SEGMENTATION & TRACKING ---
             # persist=True abilita il ByteTrack integrato che non perde MAI i soggetti
@@ -940,16 +941,30 @@ def main():
             else:
                 frame = bg_image
             
-            # Nessun flip: in base ai test, l'orientamento puro della webcam
-            # combinato con ARDUINO_PANEL_START_BOTTOM = False è quello perfetto.
-            # frame = cv2.flip(frame, 1)
             fps_voluti = cv2.getTrackbarPos('FPS Rete', 'Regia Ledwall')
             if fps_voluti == 0:
                 fps_voluti = 1  # Evita divisione per zero
             delay_ms = int(1000 / fps_voluti)
             
-            # Ridimensiona il frame alla risoluzione del ledwall e converti BGR -> RGB
-            frame_ridimensionato = cv2.resize(frame, (TOTAL_WIDTH, PANEL_HEIGHT))
+            # --- RISOLUZIONE DEL PROBLEMA DELLO STRETCH ---
+            # Calcola il fattore di scala per mantenere le proporzioni (Aspect Ratio reale)
+            # Inoltre aggiungiamo * 0.9 per fare la silhouette leggermente più piccola e non toccare i bordi.
+            h_in, w_in = frame.shape[:2]
+            scala_reale = min(PANEL_HEIGHT / h_in, TOTAL_WIDTH / w_in) * 0.90
+            
+            new_w = int(w_in * scala_reale)
+            new_h = int(h_in * scala_reale)
+            
+            frame_scaled = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            
+            # Crea un "tappeto" nero grande quanto l'intero Ledwall
+            frame_ridimensionato = np.zeros((PANEL_HEIGHT, TOTAL_WIDTH, 3), dtype=np.uint8)
+            
+            # Incolla l'immagine proporzionata esattamente al centro del ledwall
+            y_offset = (PANEL_HEIGHT - new_h) // 2
+            x_offset = (TOTAL_WIDTH - new_w) // 2
+            frame_ridimensionato[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = frame_scaled
+            
             frame_rgb = cv2.cvtColor(frame_ridimensionato, cv2.COLOR_BGR2RGB)
             
             # Applica gamma all'intero frame
@@ -968,12 +983,20 @@ def main():
                     # Estrae la fetta per questo pannello
                     fetta = frame_rgb[:, taglio_x_inizio:taglio_x_fine]
                     
-                    # === FIX: Traspone le assi per mandare pixel in colonne (alto->basso)
-                    # mantenendo i triplet RGB accoppiati correttamente ===
-                    fetta_colonne = np.transpose(fetta, (1, 0, 2)).astype(np.uint8)
-                    dati_grezzi = fetta_colonne.flatten().tobytes()
+                    # La matrice fisica è cablata per RIGHE orizzontali, non colonne! Niente transpose!
+                    fetta_righe = fetta.copy().astype(np.uint8)
                     
-                    # Taglia i dati a metà in 2 pacchetti (con byte indice)
+                    # Applica Serpentina Orizzontale ESP
+                    if ESP_START_BOTTOM:
+                        fetta_righe = fetta_righe[::-1, :, :]
+                    
+                    if ESP_SERPENTINE_HORIZONTAL:
+                        # Invertiamo l'ordine dei pixel X (colonne) per le righe Y dispari
+                        fetta_righe[1::2] = fetta_righe[1::2, ::-1, :]
+                        
+                    dati_grezzi = fetta_righe.flatten().tobytes()
+                    
+                    # Taglio esattamente a metà dei byte (15x44 = 660 LED = 1980 byte -> metà = 990 byte = 330 LED)
                     meta = len(dati_grezzi) // 2
                     pacchetto_0 = bytes([0]) + dati_grezzi[:meta]
                     pacchetto_1 = bytes([1]) + dati_grezzi[meta:]
@@ -1060,7 +1083,7 @@ def main():
             try:
                 print("[LED] Spegnimento LED Arduino...")
                 # Invia frame nero all'Arduino
-                arduino_ser.write(b'V' + bytes(ARDUINO_ROWS * ARDUINO_COLS * 3))
+                arduino_ser.write(b'\xFF\x4C\x45' + bytes(ARDUINO_ROWS * ARDUINO_COLS * 3))
                 time.sleep(0.1)
                 arduino_ser.close()
                 print("[OK] LED Arduino spenti. Seriale chiusa.")
